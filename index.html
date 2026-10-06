@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sensor Scope</title>
+<style>
+  /* Tokens: light by default, dark follows the OS */
+  :root{--bg:#f4f5f7;--fg:#15181d;--mut:#667085;--card:#fff;--line:#d9dde3;--grid:#e6e9ee;
+        --btn:#1f5fd6;--btnfg:#fff;--c0:#d9381e;--c1:#1a8f4a;--c2:#1f5fd6;color-scheme:light}
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#0e1116;--fg:#e8ebf0;--mut:#8b94a3;--card:#161a21;--line:#2a303a;--grid:#232932;
+          --btn:#3b82f6;--btnfg:#fff;--c0:#ff6b52;--c1:#46d17d;--c2:#5aa2ff;color-scheme:dark}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+  h1{font-size:18px;margin:0}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+  .bar h1{flex:1 1 auto}
+  button{font:inherit;padding:6px 12px;border:0;border-radius:6px;background:var(--btn);color:var(--btnfg)}
+  button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+  button:disabled{opacity:.4}
+  button:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+  #warn{color:var(--c0);margin:0 0 12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr));gap:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;min-width:0}
+  .card header{display:flex;gap:8px;align-items:center;justify-content:space-between}
+  .card header b{min-width:0}
+  .hz{color:var(--mut);font:12px ui-monospace,monospace;margin-left:auto}
+  .vals{display:flex;flex-wrap:wrap;gap:4px 14px;margin:8px 0;font:13px ui-monospace,monospace;font-variant-numeric:tabular-nums}
+  .vals b{display:inline-block;min-width:6ch;text-align:right}
+  canvas{width:100%;height:120px;display:block}
+  .foot{display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:8px;color:var(--mut);font-size:12px}
+  .foot span{min-width:0;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1>Sensor Scope</h1>
+  <button id="all">Start all</button>
+  <button id="none" class="ghost">Stop all</button>
+  <button id="pause" class="ghost">Pause</button>
+</div>
+<p id="warn" hidden>Not a secure context (needs HTTPS or localhost): most sensors will be blocked.</p>
+<div class="grid" id="grid"></div>
+
+<script>
+const N = 300;            // samples drawn per chart
+const MAX_ROWS = 5000;    // samples kept for CSV export
+let paused = false;
+
+// ---- helpers ----
+const on = (t, f) => { addEventListener(t, f); return () => removeEventListener(t, f); };
+
+// iOS requires a one-time permission request from a user gesture
+let motionOK = false;
+async function motion() {
+  if (motionOK) return;
+  for (const E of [window.DeviceMotionEvent, window.DeviceOrientationEvent])
+    if (typeof E?.requestPermission === 'function' && await E.requestPermission() !== 'granted')
+      throw new Error('permission denied');
+  motionOK = true;
+}
+
+// Generic Sensor API wrapper (Chromium); resolves a stop function once active
+const generic = (Cls, read) => push => new Promise((res, rej) => {
+  const s = new window[Cls]({ frequency: 30 });
+  s.addEventListener('reading', () => push(read(s)));
+  s.addEventListener('activate', () => res(() => s.stop()), { once: true });
+  s.addEventListener('error', e => rej(e.error), { once: true });
+  s.start();
+});
+
+const poll = (fn, ms = 1000) => push => { fn(push); const i = setInterval(() => fn(push), ms); return () => clearInterval(i); };
+
+// ---- sensor definitions: start(push) -> stop function ----
+const DEFS = [
+  { name: 'Accelerometer + gravity', ch: ['x', 'y', 'z'], unit: 'm/s²', d: 2, ok: () => 'DeviceMotionEvent' in window,
+    start: async push => { await motion(); return on('devicemotion', e => { const a = e.accelerationIncludingGravity; a && push([a.x, a.y, a.z]); }); } },
+  { name: 'Linear acceleration', ch: ['x', 'y', 'z'], unit: 'm/s²', d: 2, ok: () => 'DeviceMotionEvent' in window,
+    start: async push => { await motion(); return on('devicemotion', e => { const a = e.acceleration; a && push([a.x, a.y, a.z]); }); } },
+  { name: 'Gyroscope', ch: ['α', 'β', 'γ'], unit: '°/s', d: 1, ok: () => 'DeviceMotionEvent' in window,
+    start: async push => { await motion(); return on('devicemotion', e => { const r = e.rotationRate; r && push([r.alpha, r.beta, r.gamma]); }); } },
+  { name: 'Orientation', ch: ['α', 'β', 'γ'], unit: '°', d: 0, ok: () => 'DeviceOrientationEvent' in window,
+    start: async push => { await motion(); return on('deviceorientation', e => push([e.alpha, e.beta, e.gamma])); } },
+  { name: 'Magnetometer', ch: ['x', 'y', 'z'], unit: 'µT', d: 1, ok: () => 'Magnetometer' in window,
+    start: generic('Magnetometer', s => [s.x, s.y, s.z]) },
+  { name: 'Ambient light', ch: ['lux'], unit: 'lx', d: 0, ok: () => 'AmbientLightSensor' in window,
+    start: generic('AmbientLightSensor', s => [s.illuminance]) },
+  { name: 'GPS', ch: ['speed m/s', 'accuracy m'], unit: '', d: 1, ok: () => 'geolocation' in navigator,
+    start: push => {
+      const id = navigator.geolocation.watchPosition(
+        p => { const c = p.coords; push([c.speed ?? 0, c.accuracy], `${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}`); },
+        e => push([NaN], e.message), { enableHighAccuracy: true });
+      return () => navigator.geolocation.clearWatch(id);
+    } },
+  { name: 'Microphone level', ch: ['rms', 'peak'], unit: 'dBFS', d: 1, ok: () => !!navigator.mediaDevices?.getUserMedia,
+    start: async push => {
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      const ac = new AudioContext(); await ac.resume();
+      const an = ac.createAnalyser(); an.fftSize = 1024;
+      ac.createMediaStreamSource(ms).connect(an);
+      const b = new Float32Array(an.fftSize);
+      const i = setInterval(() => {
+        an.getFloatTimeDomainData(b);
+        let s = 0, p = 0;
+        for (const x of b) { s += x * x; p = Math.max(p, Math.abs(x)); }
+        push([20 * Math.log10(Math.sqrt(s / b.length) || 1e-6), 20 * Math.log10(p || 1e-6)]);
+      }, 50);
+      return () => { clearInterval(i); ms.getTracks().forEach(t => t.stop()); ac.close(); };
+    } },
+  { name: 'Battery', ch: ['level'], unit: '%', d: 0, ok: () => 'getBattery' in navigator,
+    start: async push => { const b = await navigator.getBattery(); return poll(p => p([b.level * 100], b.charging ? 'charging' : 'on battery'))(push); } },
+  { name: 'Network', ch: ['Mbps', 'RTT ms'], unit: '', d: 0, ok: () => 'connection' in navigator,
+    start: poll(p => { const c = navigator.connection; p([c.downlink, c.rtt], c.effectiveType); }) },
+];
+
+// ---- card: ring buffer + live values + canvas waveform ----
+class Card {
+  constructor(def) {
+    Object.assign(this, def);
+    this.rows = []; this.stopFn = null; this.state = 'idle'; this.note = '';
+    const el = this.el = document.createElement('section');
+    el.className = 'card';
+    el.innerHTML = `<header><b>${def.name}</b><span class="hz"></span><button class="go">Start</button></header>
+      <div class="vals">${def.ch.map((c, j) => `<span style="color:var(--c${j})">${c} <b>–</b> ${def.unit}</span>`).join('')}</div>
+      <canvas></canvas>
+      <div class="foot"><span class="st"></span><button class="ghost csv">CSV</button></div>`;
+    this.go = el.querySelector('.go'); this.cv = el.querySelector('canvas');
+    this.vals = [...el.querySelectorAll('.vals b')]; this.hz = el.querySelector('.hz'); this.st = el.querySelector('.st');
+    this.go.onclick = () => this.stopFn ? this.stop() : this.start();
+    el.querySelector('.csv').onclick = () => this.csv();
+    if (!def.ok()) { this.go.disabled = true; this.state = '✘ unsupported in this browser'; }
+  }
+  push = (v, note) => {
+    if (note !== undefined) this.note = note;
+    if (paused || !v.some(Number.isFinite)) return;
+    this.rows.push({ t: performance.now(), v });
+    if (this.rows.length > MAX_ROWS) this.rows.shift();
+  };
+  async start() {
+    if (this.stopFn || this.go.disabled) return;
+    this.state = 'starting…';
+    try { this.stopFn = await this.def_start(); this.go.textContent = 'Stop'; this.state = 'running'; }
+    catch (e) { this.stopFn = null; this.state = `✘ ${e?.name || ''} ${e?.message || e}`; }
+  }
+  def_start() { return this.constructor.starts.get(this)(this.push); }
+  stop() { this.stopFn?.(); this.stopFn = null; this.go.textContent = 'Start'; this.state = 'stopped'; }
+  csv() {
+    const t0 = this.rows[0]?.t ?? 0;
+    const text = ['t_ms,' + this.ch.join(',')].concat(this.rows.map(r => [(r.t - t0).toFixed(0), ...r.v].join(','))).join('\n');
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(new Blob([text], { type: 'text/csv' })),
+      download: this.name.replace(/\W+/g, '_') + '.csv' });
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  render() {
+    const last = this.rows.at(-1);
+    if (last) this.vals.forEach((b, j) => { b.textContent = Number.isFinite(last.v[j]) ? last.v[j].toFixed(this.d) : '–'; });
+    const now = performance.now(); let k = 0;
+    for (let i = this.rows.length - 1; i >= 0 && this.rows[i].t > now - 1000; i--) k++;
+    this.hz.textContent = this.stopFn ? `${k} Hz` : '';
+    this.st.textContent = this.state + (this.note && this.stopFn ? ' · ' + this.note : '');
+    this.draw();
+  }
+  draw() {
+    const c = this.cv, dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+    const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const rows = this.rows.slice(-N); if (!rows.length) return;
+    let lo = Infinity, hi = -Infinity;
+    for (const r of rows) for (const x of r.v) { if (x < lo) lo = x; if (x > hi) hi = x; }
+    if (!isFinite(lo)) return;
+    if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
+    const pad = (hi - lo) * .1; lo -= pad; hi += pad;
+    const css = getComputedStyle(document.documentElement);
+    const X = i => (N - rows.length + i) / (N - 1) * w, Y = v => h - (v - lo) / (hi - lo) * h;
+    g.font = '10px ui-monospace,monospace'; g.lineWidth = 1;
+    for (let k = 0; k <= 4; k++) {            // grid + y labels
+      const y = Math.round(h * k / 4) + .5;
+      g.strokeStyle = css.getPropertyValue('--grid'); g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+      g.fillStyle = css.getPropertyValue('--mut');
+      g.fillText((hi - (hi - lo) * k / 4).toFixed(this.d), 2, Math.min(Math.max(y - 2, 10), h - 2));
+    }
+    this.ch.forEach((_, j) => {               // one trace per channel
+      g.beginPath(); g.strokeStyle = css.getPropertyValue('--c' + j); g.lineWidth = 1.5;
+      let pen = false;
+      rows.forEach((r, i) => {
+        const v = r.v[j]; if (!Number.isFinite(v)) { pen = false; return; }
+        pen ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); pen = true;
+      });
+      g.stroke();
+    });
+  }
+}
+Card.starts = new Map();
+
+// ---- wire up ----
+const cards = DEFS.map(d => { const c = new Card(d); Card.starts.set(c, d.start); return c; });
+cards.forEach(c => document.getElementById('grid').appendChild(c.el));
+document.getElementById('warn').hidden = isSecureContext;
+
+// Start sequentially so the first motion card consumes the iOS user gesture
+document.getElementById('all').onclick = async () => { for (const c of cards) await c.start(); };
+document.getElementById('none').onclick = () => cards.forEach(c => c.stopFn && c.stop());
+document.getElementById('pause').onclick = e => { paused = !paused; e.target.textContent = paused ? 'Resume' : 'Pause'; };
+
+(function loop() { cards.forEach(c => c.render()); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
