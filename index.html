@@ -118,7 +118,10 @@ const DEFS = [
 // ---- card: ring buffer + live values + canvas waveform ----
 class Card {
   constructor(def) {
-    Object.assign(this, def);
+    // Keep the sensor's start fn under another name: copying it onto the instance would shadow the start() method
+    const { start, ...rest } = def;
+    Object.assign(this, rest);
+    this.startFn = start;
     this.rows = []; this.stopFn = null; this.state = 'idle'; this.note = '';
     const el = this.el = document.createElement('section');
     el.className = 'card';
@@ -141,10 +144,9 @@ class Card {
   async start() {
     if (this.stopFn || this.go.disabled) return;
     this.state = 'starting…';
-    try { this.stopFn = await this.def_start(); this.go.textContent = 'Stop'; this.state = 'running'; }
+    try { this.stopFn = await this.startFn(this.push); this.go.textContent = 'Stop'; this.state = 'running'; }
     catch (e) { this.stopFn = null; this.state = `✘ ${e?.name || ''} ${e?.message || e}`; }
   }
-  def_start() { return this.constructor.starts.get(this)(this.push); }
   stop() { this.stopFn?.(); this.stopFn = null; this.go.textContent = 'Start'; this.state = 'stopped'; }
   csv() {
     const t0 = this.rows[0]?.t ?? 0;
@@ -193,10 +195,9 @@ class Card {
     });
   }
 }
-Card.starts = new Map();
 
 // ---- wire up ----
-const cards = DEFS.map(d => { const c = new Card(d); Card.starts.set(c, d.start); return c; });
+const cards = DEFS.map(d => new Card(d));
 cards.forEach(c => document.getElementById('grid').appendChild(c.el));
 document.getElementById('warn').hidden = isSecureContext;
 
